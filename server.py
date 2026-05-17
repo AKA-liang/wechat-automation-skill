@@ -1,7 +1,6 @@
 # server.py
 # 整合后的 WeChat MCP Server
-# 核心思路：用 PeekabooWin OCR 文本点击（click --on）定位联系人，
-#         用 PyAutoGUI + 剪贴板发送中文，绕过输入法问题
+# 核心思路：最大化窗口 + Ctrl+F 搜索流程打开联系人，剪贴板粘贴发送消息
 
 import asyncio
 import json
@@ -17,11 +16,16 @@ from peekaboo_integration import (
     peekaboo,
     peekaboo_see,
     click_on_text,
+    click_by_element_id,
     click_coordinates,
     type_text,
     press_keys,
     focus_window,
     PEEKABOO_PATH,
+    search_and_open_contact,
+    send_message_via_clipboard,
+    maximize_wechat,
+    get_wechat_hwnd,
 )
 
 
@@ -31,126 +35,94 @@ def send_message_to_contact(contact_name: str, message: str) -> tuple:
     """给指定联系人发送消息（完整流程）"""
     print(f"[Send] Target: {contact_name}, Message: {message}")
 
-    # Step 0: 恢复微信窗口
-    print("\n[0/6] Restoring WeChat window...")
-    ok, info = restore_wechat_window()
+    # Step 1: 搜索并打开联系人聊天窗口
+    print(f"\n[1/4] Searching and opening chat with {contact_name}...")
+    ok = search_and_open_contact(contact_name)
     if not ok:
-        return False, info
-    print(f"[0/6] Window restored: {info}")
+        return False, f"无法打开与 {contact_name} 的聊天窗口"
 
-    # Step 1: 聚焦窗口
-    print("\n[1/6] Focusing window...")
-    focus_window("微信")
-    time.sleep(0.5)
+    # Step 2: 聚焦窗口
+    print("\n[2/4] Focusing window...")
+    hwnd = get_wechat_hwnd()
+    if hwnd:
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
+    time.sleep(0.3)
 
-    # Step 2: 用 OCR 文本点击找到并点击联系人
-    print(f"\n[2/6] Clicking contact: {contact_name}...")
-    ok, output = click_on_text(contact_name, snapshot_id="latest")
+    # Step 3: 点击输入框（用 OCR 找"输入"文字）
+    print("\n[3/4] Clicking input field...")
+    ok, _ = click_on_text("输入", snapshot_id="latest")
     if not ok:
-        return False, f"Cannot find contact '{contact_name}' on screen: {output[:200]}"
+        # 降级：窗口中央下方坐标
+        try:
+            snapshot = peekaboo_see(title="微信", mode="window")
+            bounds = snapshot["data"].get("bounds", {})
+            wl = bounds.get("left", 0)
+            wt = bounds.get("top", 0)
+            ww = bounds.get("width", 1100)
+            wh = bounds.get("height", 800)
+            cx = wl + ww // 2
+            cy = wt + wh - 70
+            click_coordinates(int(cx), int(cy))
+        except Exception as e:
+            print(f"[3/4] Click fallback: {e}")
+    time.sleep(0.3)
 
-    time.sleep(2)  # 等待聊天页加载
-
-    # Step 3: 等待聊天页加载后再次截图确认
-    print("\n[3/6] Verifying chat page...")
-    try:
-        snapshot = peekaboo_see(title="微信", mode="window")
-        print(f"[3/6] Chat page verified, elements: {len(snapshot['data'].get('elements', []))}")
-    except Exception as e:
-        print(f"[3/6] Verification skip: {e}")
-
-    # Step 4: 点击输入框（用 OCR 找"输入"相关文字，否则坐标降级）
-    print("\n[4/6] Clicking input field...")
-    _click_input_field()
-
-    # Step 5: 输入消息（中文用剪贴板，英文用 peekaboo type）
-    print("\n[5/6] Typing message...")
-    _type_message(message)
-
-    # Step 6: 发送
-    print("\n[6/6] Pressing Enter to send...")
-    press_keys("{ENTER}")
-    time.sleep(0.5)
+    # Step 4: 发送消息
+    print("\n[4/4] Sending message...")
+    ok = send_message_via_clipboard(message)
+    if not ok:
+        return False, "发送失败"
 
     return True, None
-
-
-def _click_input_field():
-    """点击输入框 - 优先用 OCR 找"输入"相关文字，否则坐标降级"""
-    # 尝试用 OCR 点击输入框提示文字
-    ok, _ = click_on_text("输入", snapshot_id="latest")
-    if ok:
-        print("[4/6] Input field clicked via OCR")
-        return
-
-    # 降级：坐标点击（窗口中央下方）
-    try:
-        snapshot = peekaboo_see(title="微信", mode="window")
-        bounds = snapshot["data"].get("bounds", {})
-        win_left = bounds.get("left", 0)
-        win_top = bounds.get("top", 0)
-        win_width = bounds.get("width", 1100)
-        win_height = bounds.get("height", 800)
-        input_x = win_left + win_width // 2
-        input_y = win_top + win_height - 70
-        click_coordinates(int(input_x), int(input_y))
-        print(f"[4/6] Input field clicked via coords ({input_x}, {input_y})")
-    except Exception as e:
-        print(f"[4/6] Click fallback error: {e}")
-
-
-def _type_message(message: str):
-    """输入消息 - 优先 pyperclip 剪贴板（解决中文输入法问题）"""
-    try:
-        pyperclip.copy(message)
-        time.sleep(0.1)
-        pyautogui.hotkey("ctrl", "v")
-        time.sleep(0.3)
-    except Exception as e:
-        # 降级：用 peekaboo type
-        print(f"[5/6] Clipboard failed, using peekaboo type: {e}")
-        type_text(message)
 
 
 def send_message_to_current(message: str) -> tuple:
     """给当前已打开的聊天窗口发送消息（不需要指定联系人）"""
     print(f"[Send to current] Message: {message}")
 
-    # Step 0: 恢复窗口
+    # Step 1: 恢复并聚焦窗口
     ok, info = restore_wechat_window()
     if not ok:
         return False, info
 
-    # Step 1: 聚焦窗口
-    focus_window("微信")
-    time.sleep(0.5)
-
-    # Step 2: 找输入框并点击
-    _click_input_field()
+    hwnd = get_wechat_hwnd()
+    if hwnd:
+        ctypes.windll.user32.SetForegroundWindow(hwnd)
     time.sleep(0.3)
 
-    # Step 3: 输入
-    _type_message(message)
+    # Step 2: 点击输入框
+    ok, _ = click_on_text("输入", snapshot_id="latest")
+    if not ok:
+        try:
+            snapshot = peekaboo_see(title="微信", mode="window")
+            bounds = snapshot["data"].get("bounds", {})
+            wl = bounds.get("left", 0)
+            wt = bounds.get("top", 0)
+            ww = bounds.get("width", 1100)
+            wh = bounds.get("height", 800)
+            click_coordinates(int(wl + ww // 2), int(wt + wh - 70))
+        except Exception:
+            pass
+    time.sleep(0.3)
 
-    # Step 4: 发送
-    press_keys("{ENTER}")
-    time.sleep(0.5)
+    # Step 3: 发送
+    ok = send_message_via_clipboard(message)
+    if not ok:
+        return False, "发送失败"
 
     return True, None
 
 
 def get_wechat_status() -> dict:
     """获取微信状态"""
-    ok, info = restore_wechat_window()
-    if not ok:
-        return {"status": "not_running", "message": info}
+    hwnd = get_wechat_hwnd()
+    if not hwnd:
+        return {"status": "not_running"}
 
     return {
         "status": "running",
         "peekaboo_available": PEEKABOO_PATH is not None,
         "peekaboo_path": PEEKABOO_PATH,
-        "position": info["position"],
-        "size": info["size"],
     }
 
 
@@ -164,7 +136,7 @@ TOOLS = [
     },
     {
         "name": "wechat_send_message",
-        "description": "给指定联系人发送消息（OCR文本点击联系人 + 剪贴板输入）",
+        "description": "给指定联系人发送消息（通过搜索流程打开聊天 + 剪贴板粘贴发送）",
         "inputSchema": {
             "type": "object",
             "properties": {
